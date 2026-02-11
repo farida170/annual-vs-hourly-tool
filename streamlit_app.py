@@ -2,27 +2,34 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 st.set_page_config(page_title="Annual vs Hourly Carbon Accounting", layout="wide")
-st.title("Annual vs Hourly Carbon Accounting — Interactive Tool")
+st.title("Annual vs Hourly Carbon Accounting — Spain Demo (Embedded Data)")
 
-st.sidebar.header("Upload required files")
-up_demand = st.sidebar.file_uploader("Demand CSV (hourly)", type=["csv"])
-up_ci = st.sidebar.file_uploader("Carbon Intensity CSV (hourly)", type=["csv"])
-up_wind = st.sidebar.file_uploader("Wind CF CSV (hourly)", type=["csv"])
-up_solar = st.sidebar.file_uploader("Solar CF CSV (hourly)", type=["csv"])
-up_gridcfe = st.sidebar.file_uploader("Grid CFE share CSV (optional)", type=["csv"])
+# ----------------------------
+# Data paths (repo-relative)
+# ----------------------------
+DATA_DIR = Path(__file__).parent / "data"
+FILES = {
+    "demand": DATA_DIR / "ES_demand_2024.csv",
+    "ci": DATA_DIR / "ES_carbon_intensity_hourly_2024.csv",
+    "cf_wind": DATA_DIR / "ES_cf_wind_2024.csv",
+    "cf_solar": DATA_DIR / "ES_cf_solar_2024.csv",
+    "grid_cfe": DATA_DIR / "ES_grid_cfe_2024.csv",
+    # optional (not required for core engine yet)
+    "prod_breakdown": DATA_DIR / "ES_power_production_breakdown_hourly_2024.csv",
+    "cons_breakdown": DATA_DIR / "ES_power_breakdown_consumption_hourly_2024.csv",
+}
 
-st.sidebar.header("Scenario controls")
-hourly_target = st.sidebar.slider("Hourly target (x)", 0.50, 1.00, 0.90, 0.05)
-wind_share = st.sidebar.slider("Wind share of annual procured energy", 0.0, 1.0, 0.5, 0.05)
-solar_share = 1.0 - wind_share
-residual_rule = st.sidebar.selectbox(
-    "Annual residual allocation (for emissions attribution)",
-    ["proportional_to_demand", "allocate_to_highest_CI_hours"],
-    index=0
-)
+missing = [k for k,p in FILES.items() if (("breakdown" not in k) and (not p.exists()))]
+if missing:
+    st.error(f"Missing required data files in /data: {missing}")
+    st.stop()
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def parse_ts_utc(s):
     return pd.to_datetime(s, errors="coerce", utc=True)
 
@@ -123,65 +130,65 @@ def hourly_accounting(df, target):
         "emissions_rate_tco2_per_mwh": emissions / total_d if total_d > 0 else np.nan,
     }, residual, coverage
 
-# Require core uploads
-if up_demand is None or up_ci is None or up_wind is None or up_solar is None:
-    st.info("Upload Demand, Carbon Intensity, Wind CF, and Solar CF CSVs to begin.")
-    st.stop()
+# ----------------------------
+# Load data
+# ----------------------------
+@st.cache_data
+def load_inputs():
+    demand = pd.read_csv(FILES["demand"])
+    ci = pd.read_csv(FILES["ci"])
+    wind = pd.read_csv(FILES["cf_wind"])
+    solar = pd.read_csv(FILES["cf_solar"])
+    gridcfe = pd.read_csv(FILES["grid_cfe"])
 
-demand = pd.read_csv(up_demand)
-ci = pd.read_csv(up_ci)
-wind = pd.read_csv(up_wind)
-solar = pd.read_csv(up_solar)
-gridcfe = pd.read_csv(up_gridcfe) if up_gridcfe is not None else None
+    demand["ts_utc"] = parse_ts_utc(demand["datetime"])
+    ci["ts_utc"] = parse_ts_utc(ci["datetime"])
+    wind["ts_utc"] = parse_ts_utc(wind["timestamp"])
+    solar["ts_utc"] = parse_ts_utc(solar["timestamp"])
 
-# Robust-ish column detection (first column timestamp)
-demand_ts = "datetime" if "datetime" in demand.columns else demand.columns[0]
-ci_ts = "datetime" if "datetime" in ci.columns else ci.columns[0]
-wind_ts = "timestamp" if "timestamp" in wind.columns else wind.columns[0]
-solar_ts = "timestamp" if "timestamp" in solar.columns else solar.columns[0]
+    # grid CFE timestamps are naive in your file; assume UTC
+    gridcfe["ts_utc"] = pd.to_datetime(gridcfe["timestamp"], errors="coerce").dt.tz_localize("UTC")
 
-demand["ts_utc"] = parse_ts_utc(demand[demand_ts])
-ci["ts_utc"] = parse_ts_utc(ci[ci_ts])
-wind["ts_utc"] = parse_ts_utc(wind[wind_ts])
-solar["ts_utc"] = parse_ts_utc(solar[solar_ts])
+    df = (
+        demand[["ts_utc", "load_MW"]]
+        .merge(ci[["ts_utc", "carbonIntensity"]], on="ts_utc", how="inner")
+        .merge(wind[["ts_utc", "cf"]].rename(columns={"cf": "cf_wind"}), on="ts_utc", how="inner")
+        .merge(solar[["ts_utc", "cf"]].rename(columns={"cf": "cf_solar"}), on="ts_utc", how="inner")
+        .merge(gridcfe[["ts_utc", "cfe"]].rename(columns={"cfe": "grid_cfe_share"}), on="ts_utc", how="left")
+        .sort_values("ts_utc")
+        .reset_index(drop=True)
+    )
 
-# numeric columns (fallback to 2nd column)
-demand_val = "load_MW" if "load_MW" in demand.columns else demand.columns[1]
-ci_val = "carbonIntensity" if "carbonIntensity" in ci.columns else ci.columns[1]
-wind_val = "cf" if "cf" in wind.columns else wind.columns[1]
-solar_val = "cf" if "cf" in solar.columns else solar.columns[1]
+    df["demand_mwh"] = pd.to_numeric(df["load_MW"], errors="coerce")
+    df["ci_tco2_per_mwh"], ci_note = convert_ci_to_tco2_per_mwh(df["carbonIntensity"])
+    return df, ci_note
 
-df = (
-    demand[["ts_utc", demand_val]].rename(columns={demand_val: "load"})
-    .merge(ci[["ts_utc", ci_val]].rename(columns={ci_val: "carbonIntensity"}), on="ts_utc", how="inner")
-    .merge(wind[["ts_utc", wind_val]].rename(columns={wind_val: "cf_wind"}), on="ts_utc", how="inner")
-    .merge(solar[["ts_utc", solar_val]].rename(columns={solar_val: "cf_solar"}), on="ts_utc", how="inner")
+df, ci_note = load_inputs()
+
+# ----------------------------
+# Controls (no uploads; just sliders)
+# ----------------------------
+st.sidebar.header("Scenario controls")
+hourly_target = st.sidebar.slider("Hourly target (x)", 0.50, 1.00, 0.90, 0.05)
+wind_share = st.sidebar.slider("Wind share of annual procured energy", 0.0, 1.0, 0.5, 0.05)
+solar_share = 1.0 - wind_share
+residual_rule = st.sidebar.selectbox(
+    "Annual residual allocation (for emissions attribution)",
+    ["proportional_to_demand", "allocate_to_highest_CI_hours"],
+    index=0
 )
-
-if gridcfe is not None:
-    gc_ts = "timestamp" if "timestamp" in gridcfe.columns else gridcfe.columns[0]
-    gc_val = "cfe" if "cfe" in gridcfe.columns else gridcfe.columns[1]
-    ts = pd.to_datetime(gridcfe[gc_ts], errors="coerce")
-    gridcfe["ts_utc"] = ts.dt.tz_localize("UTC") if ts.dt.tz is None else ts.dt.tz_convert("UTC")
-    df = df.merge(gridcfe[["ts_utc", gc_val]].rename(columns={gc_val: "grid_cfe_share"}), on="ts_utc", how="left")
-else:
-    df["grid_cfe_share"] = np.nan
-
-df = df.sort_values("ts_utc").reset_index(drop=True)
-df["demand_mwh"] = pd.to_numeric(df["load"], errors="coerce")
-df["ci_tco2_per_mwh"], ci_note = convert_ci_to_tco2_per_mwh(df["carbonIntensity"])
-
-st.caption(f"Loaded **{len(df)}** hourly rows. Carbon intensity conversion: **{ci_note}**.")
 
 df["procured_cfe_mwh"], cap_wind_mw, cap_solar_mw = build_procured_profile_from_cfs(df, wind_share, solar_share)
 
 base = baseline_grid_only(df)
-annual, annual_resid = annual_accounting(df, residual_allocation=residual_rule)
+annual, _ = annual_accounting(df, residual_allocation=residual_rule)
 hourly, hourly_resid, hourly_cov = hourly_accounting(df, hourly_target)
 
 kpis = pd.DataFrame([base, annual, hourly])
 baseline_emis = base["emissions_tco2"]
 kpis["avoided_emissions_tco2_vs_grid"] = baseline_emis - kpis["emissions_tco2"]
+
+st.caption(f"Loaded **{len(df)}** hourly rows (Spain 2024). Carbon intensity conversion: **{ci_note}**.")
 
 col1, col2 = st.columns([1.05, 0.95], gap="large")
 
@@ -203,8 +210,8 @@ with col1:
     st.pyplot(fig)
 
 with col2:
-    st.subheader("When does hourly matching fail?")
-    st.markdown("**Residual demand duration curve (hourly accounting)**")
+    st.subheader("Where hourly matching fails")
+    st.markdown("**Residual demand duration curve (hourly)**")
     resid_sorted = np.sort(hourly_resid)[::-1]
     fig2 = plt.figure(figsize=(8, 3.2))
     plt.plot(resid_sorted)
