@@ -1,6 +1,7 @@
 # streamlit_app.py
 # Spain 2024 — Annual vs Hourly Carbon Accounting (TU-style procurement sizing LP)
 # Streamlit Cloud-safe: UI loads first; optimization runs only on click; YEAR FIXED TO 2024
+# FIX: Matplotlib norm + vmin/vmax conflict (PowerNorm must not be combined with vmin/vmax in imshow)
 
 from pathlib import Path
 
@@ -9,7 +10,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, PowerNorm
-from scipy.optimize import linprog
 
 st.set_page_config(page_title="Annual vs Hourly Carbon Accounting — Spain (2024)", layout="wide")
 
@@ -115,9 +115,29 @@ def pivot_day_hour(ts_utc, values):
     tmp["hour"] = tmp["ts"].dt.hour
     return tmp.pivot_table(index="date", columns="hour", values="v", aggfunc="mean").reindex(columns=list(range(24)))
 
+# ✅ FIXED: do not pass vmin/vmax when norm is provided
 def plot_heatmap(pivot, title, cbar_label, cmap, vmin=None, vmax=None, norm=None):
     fig = plt.figure(figsize=(10, 4.6))
-    plt.imshow(pivot.to_numpy(), aspect="auto", interpolation="nearest", cmap=cmap, vmin=vmin, vmax=vmax, norm=norm)
+    data = pivot.to_numpy()
+
+    if norm is not None:
+        plt.imshow(
+            data,
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap,
+            norm=norm,
+        )
+    else:
+        plt.imshow(
+            data,
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+
     plt.colorbar(label=cbar_label)
     plt.title(title)
     plt.xlabel("Hour of day (UTC)")
@@ -183,7 +203,6 @@ def load_and_build_2024():
     price = price.rename(columns={price_col: "price_eur_per_mwh"})
     price["price_eur_per_mwh"] = pd.to_numeric(price["price_eur_per_mwh"], errors="coerce")
 
-    # Filter to YEAR
     demand_y = demand[demand["ts_utc"].dt.year == YEAR]
     ci_y = ci[ci["ts_utc"].dt.year == YEAR]
     wind_y = wind[wind["ts_utc"].dt.year == YEAR]
@@ -215,6 +234,9 @@ def load_and_build_2024():
 # LP model (Route 1)
 # -----------------------------
 def solve_procurement_lp(df, policy, x_target, allow_battery, params):
+    # Import inside function to reduce startup risk on Streamlit Cloud
+    from scipy.optimize import linprog
+
     T = len(df)
     demand = df["demand_mwh"].to_numpy()
     cfw = df["cf_wind"].to_numpy()
@@ -414,8 +436,7 @@ with tab_heat:
         "Spain — Grid CFE (2024)",
         "CFE (0–1)",
         CFE_CMAP,
-        vmin=0, vmax=1,
-        norm=PowerNorm(gamma=1.25)
+        norm=PowerNorm(gamma=1.25, vmin=0, vmax=1)  # vmin/vmax embedded in norm
     ))
 
     ci_vals = df["ci_tco2_per_mwh"].to_numpy()
@@ -427,8 +448,7 @@ with tab_heat:
         "Spain — Grid Carbon Intensity (2024)",
         "tCO₂/MWh",
         CI_CMAP,
-        vmin=vmin_ci, vmax=vmax_ci,
-        norm=PowerNorm(gamma=1.10)
+        norm=PowerNorm(gamma=1.10, vmin=vmin_ci, vmax=vmax_ci)  # vmin/vmax embedded in norm
     ))
 
     piv_p = pivot_day_hour(df["ts_utc"], df["price_eur_per_mwh"])
@@ -437,7 +457,9 @@ with tab_heat:
         "Spain — Day-ahead Price (2024)",
         "€/MWh",
         PRICE_CMAP,
-        vmin=-200, vmax=200
+        vmin=-200,
+        vmax=200,
+        norm=None
     ))
 
 with tab_model:
@@ -468,6 +490,7 @@ with tab_model:
             st.markdown("### Annual matching")
             st.metric("Cost (€/MWh)", f"{mA['cost_eur_per_mwh']:.2f}")
             st.metric("Emissions rate (tCO₂/MWh)", f"{mA['emissions_rate_tco2_per_mwh']:.3f}")
+            st.metric("Achieved clean share", f"{mA['achieved_clean_share']*100:.1f}%")
             st.metric("Wind (MW)", f"{mA['W_mw']:,.0f}")
             st.metric("Solar (MW)", f"{mA['S_mw']:,.0f}")
             st.metric("Battery P (MW)", f"{mA['BatP_mw']:,.0f}")
@@ -477,6 +500,7 @@ with tab_model:
             st.markdown(f"### Hourly matching (target {int(x_target*100)}%)")
             st.metric("Cost (€/MWh)", f"{mH['cost_eur_per_mwh']:.2f}")
             st.metric("Emissions rate (tCO₂/MWh)", f"{mH['emissions_rate_tco2_per_mwh']:.3f}")
+            st.metric("Achieved clean share", f"{mH['achieved_clean_share']*100:.1f}%")
             st.metric("Wind (MW)", f"{mH['W_mw']:,.0f}")
             st.metric("Solar (MW)", f"{mH['S_mw']:,.0f}")
             st.metric("Battery P (MW)", f"{mH['BatP_mw']:,.0f}")
@@ -491,3 +515,27 @@ with tab_model:
         plt.legend()
         plt.tight_layout()
         st.pyplot(fig)
+
+        st.subheader("Downloads")
+        metrics_df = pd.DataFrame([
+            {"scenario": "annual", "target": 1.0, **mA},
+            {"scenario": "hourly", "target": x_target, **mH},
+        ])
+        st.download_button(
+            "Download metrics (CSV)",
+            metrics_df.to_csv(index=False).encode("utf-8"),
+            "metrics_annual_vs_hourly.csv",
+            "text/csv",
+        )
+        st.download_button(
+            "Download dispatch (annual) CSV",
+            tsA.to_csv(index=False).encode("utf-8"),
+            "dispatch_annual.csv",
+            "text/csv",
+        )
+        st.download_button(
+            "Download dispatch (hourly) CSV",
+            tsH.to_csv(index=False).encode("utf-8"),
+            "dispatch_hourly.csv",
+            "text/csv",
+        )
