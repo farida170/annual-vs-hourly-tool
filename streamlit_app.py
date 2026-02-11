@@ -1,8 +1,7 @@
 # streamlit_app.py
-# Streamlit Cloud-safe version: load UI first, run optimization only on button click,
-# plus strong debug output to figure out what breaks.
+# Spain 2024 — Annual vs Hourly Carbon Accounting (TU-style procurement sizing LP)
+# Streamlit Cloud-safe: UI loads first; optimization runs only on click; YEAR FIXED TO 2024
 
-import os
 from pathlib import Path
 
 import streamlit as st
@@ -12,23 +11,14 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, PowerNorm
 from scipy.optimize import linprog
 
-st.set_page_config(page_title="Annual vs Hourly Carbon Accounting — Spain", layout="wide")
+st.set_page_config(page_title="Annual vs Hourly Carbon Accounting — Spain (2024)", layout="wide")
 
-st.write("✅ App started")  # checkpoint 1
+YEAR = 2024
 
 # -----------------------------
 # Paths
 # -----------------------------
 DATA_DIR = Path(__file__).parent / "data"
-st.write("📁 DATA_DIR:", str(DATA_DIR))
-
-if not DATA_DIR.exists():
-    st.error("data/ folder not found in the deployed repo. Create a data/ folder and commit it.")
-    st.stop()
-
-# show files present (crucial!)
-data_files = sorted([p.name for p in DATA_DIR.glob("*")])
-st.write("📄 Files in data/:", data_files)
 
 REQUIRED = [
     "ES_demand_2024.csv",
@@ -38,6 +28,17 @@ REQUIRED = [
     "ES_cf_solar_2024.csv",
     "Spain.csv",
 ]
+
+st.title("Spain — Annual vs Hourly Carbon Accounting (2024)")
+st.caption("Interactive procurement sizing LP (TU-style). Fixed year: 2024.")
+
+if not DATA_DIR.exists():
+    st.error("data/ folder not found in the deployed repo. Create a data/ folder and commit it.")
+    st.stop()
+
+present = sorted([p.name for p in DATA_DIR.glob("*")])
+st.write("📄 Files in data/:", present)
+
 missing = [f for f in REQUIRED if not (DATA_DIR / f).exists()]
 if missing:
     st.error(f"Missing required files in /data: {missing}")
@@ -51,8 +52,6 @@ FILES = {
     "cf_solar": DATA_DIR / "ES_cf_solar_2024.csv",
     "price": DATA_DIR / "Spain.csv",
 }
-
-st.write("✅ Data files found")  # checkpoint 2
 
 # -----------------------------
 # TU-style assumptions (editable)
@@ -95,7 +94,8 @@ def parse_ts_utc(series):
 def convert_ci_to_tco2_per_mwh(ci_series):
     x = pd.to_numeric(ci_series, errors="coerce")
     m = x.dropna().mean()
-    if m is not None and m > 5:  # likely gCO2/kWh
+    # Electricity Maps carbonIntensity is often gCO2/kWh
+    if m is not None and m > 5:
         return x * 0.001, "gCO2/kWh → tCO2/MWh (×0.001)"
     return x, "tCO2/MWh (assumed)"
 
@@ -126,80 +126,16 @@ def plot_heatmap(pivot, title, cbar_label, cmap, vmin=None, vmax=None, norm=None
     plt.tight_layout()
     return fig
 
-@st.cache_data
-def load_all():
-    demand = pd.read_csv(FILES["demand"])
-    ci = pd.read_csv(FILES["ci"])
-    wind = pd.read_csv(FILES["cf_wind"])
-    solar = pd.read_csv(FILES["cf_solar"])
-    grid = pd.read_csv(FILES["grid_cfe"])
-    price = pd.read_csv(FILES["price"])
-
-    # timestamps
-    demand["ts_utc"] = parse_ts_utc(demand["datetime"])
-    ci["ts_utc"] = parse_ts_utc(ci["datetime"])
-    wind["ts_utc"] = parse_ts_utc(wind["timestamp"])
-    solar["ts_utc"] = parse_ts_utc(solar["timestamp"])
-
-    # grid CFE timestamps: naive => UTC
-    grid["ts_utc"] = pd.to_datetime(grid["timestamp"], errors="coerce").dt.tz_localize("UTC")
-
-    # Ember columns: detect
-    dt_col = next((c for c in price.columns if "datetime" in c.lower() and "utc" in c.lower()), None)
+def detect_ember_columns(price_df: pd.DataFrame):
+    dt_col = next((c for c in price_df.columns if "datetime" in c.lower() and "utc" in c.lower()), None)
     if dt_col is None:
-        dt_col = price.columns[0]
+        dt_col = price_df.columns[0]
 
-    price_col = next((c for c in price.columns if "price" in c.lower() and "eur" in c.lower()), None)
+    price_col = next((c for c in price_df.columns if "price" in c.lower() and "eur" in c.lower()), None)
     if price_col is None:
-        price_col = price.columns[1] if len(price.columns) > 1 else price.columns[0]
+        price_col = price_df.columns[1] if len(price_df.columns) > 1 else price_df.columns[0]
 
-    st.write("🧾 Ember detected columns:", {"datetime_col": dt_col, "price_col": price_col})
-
-    ts = pd.to_datetime(price[dt_col], errors="coerce")
-    if ts.dt.tz is None:
-        price["ts_utc"] = ts.dt.tz_localize("UTC")
-    else:
-        price["ts_utc"] = ts.dt.tz_convert("UTC")
-
-    price = price.rename(columns={price_col: "price_eur_per_mwh"})
-    price["price_eur_per_mwh"] = pd.to_numeric(price["price_eur_per_mwh"], errors="coerce")
-
-    return demand, ci, wind, solar, grid, price
-
-def available_years(demand, ci, wind, solar, grid, price):
-    sets = []
-    for d in [demand, ci, wind, solar, grid, price]:
-        sets.append(set(d["ts_utc"].dt.year.dropna().unique()))
-    return sorted(set.intersection(*sets)) if sets else []
-
-def build_df_for_year(year, demand, ci, wind, solar, grid, price):
-    d = demand[demand["ts_utc"].dt.year == year].copy()
-    c = ci[ci["ts_utc"].dt.year == year].copy()
-    w = wind[wind["ts_utc"].dt.year == year].copy()
-    s = solar[solar["ts_utc"].dt.year == year].copy()
-    g = grid[grid["ts_utc"].dt.year == year].copy()
-    p = price[price["ts_utc"].dt.year == year].copy()
-
-    if min(len(d), len(c), len(w), len(s), len(g), len(p)) == 0:
-        return None, None
-
-    df = (
-        d[["ts_utc", "load_MW"]]
-        .merge(c[["ts_utc", "carbonIntensity"]], on="ts_utc", how="inner")
-        .merge(w[["ts_utc", "cf"]].rename(columns={"cf": "cf_wind"}), on="ts_utc", how="inner")
-        .merge(s[["ts_utc", "cf"]].rename(columns={"cf": "cf_solar"}), on="ts_utc", how="inner")
-        .merge(g[["ts_utc", "cfe"]].rename(columns={"cfe": "grid_cfe"}), on="ts_utc", how="left")
-        .merge(p[["ts_utc", "price_eur_per_mwh"]], on="ts_utc", how="left")
-        .sort_values("ts_utc")
-        .reset_index(drop=True)
-    )
-
-    df["demand_mwh"] = pd.to_numeric(df["load_MW"], errors="coerce")
-    df["ci_tco2_per_mwh"], note = convert_ci_to_tco2_per_mwh(df["carbonIntensity"])
-    df["price_eur_per_mwh"] = df["price_eur_per_mwh"].fillna(df["price_eur_per_mwh"].mean())
-
-    df = df.dropna(subset=["demand_mwh", "cf_wind", "cf_solar", "ci_tco2_per_mwh", "price_eur_per_mwh"]).reset_index(drop=True)
-    return df, note
+    return dt_col, price_col
 
 def slice_df(df, mode):
     df = df.sort_values("ts_utc").reset_index(drop=True)
@@ -220,6 +156,62 @@ def slice_df(df, mode):
     return df  # Full year
 
 # -----------------------------
+# Load + build 2024 dataset
+# (IMPORTANT: no st.write inside cached functions)
+# -----------------------------
+@st.cache_data
+def load_and_build_2024():
+    demand = pd.read_csv(FILES["demand"])
+    ci = pd.read_csv(FILES["ci"])
+    wind = pd.read_csv(FILES["cf_wind"])
+    solar = pd.read_csv(FILES["cf_solar"])
+    grid = pd.read_csv(FILES["grid_cfe"])
+    price = pd.read_csv(FILES["price"])
+
+    demand["ts_utc"] = parse_ts_utc(demand["datetime"])
+    ci["ts_utc"] = parse_ts_utc(ci["datetime"])
+    wind["ts_utc"] = parse_ts_utc(wind["timestamp"])
+    solar["ts_utc"] = parse_ts_utc(solar["timestamp"])
+    grid["ts_utc"] = pd.to_datetime(grid["timestamp"], errors="coerce").dt.tz_localize("UTC")
+
+    dt_col, price_col = detect_ember_columns(price)
+    ts = pd.to_datetime(price[dt_col], errors="coerce")
+    if ts.dt.tz is None:
+        price["ts_utc"] = ts.dt.tz_localize("UTC")
+    else:
+        price["ts_utc"] = ts.dt.tz_convert("UTC")
+    price = price.rename(columns={price_col: "price_eur_per_mwh"})
+    price["price_eur_per_mwh"] = pd.to_numeric(price["price_eur_per_mwh"], errors="coerce")
+
+    # Filter to YEAR
+    demand_y = demand[demand["ts_utc"].dt.year == YEAR]
+    ci_y = ci[ci["ts_utc"].dt.year == YEAR]
+    wind_y = wind[wind["ts_utc"].dt.year == YEAR]
+    solar_y = solar[solar["ts_utc"].dt.year == YEAR]
+    grid_y = grid[grid["ts_utc"].dt.year == YEAR]
+    price_y = price[price["ts_utc"].dt.year == YEAR]
+
+    df = (
+        demand_y[["ts_utc", "load_MW"]]
+        .merge(ci_y[["ts_utc", "carbonIntensity"]], on="ts_utc", how="inner")
+        .merge(wind_y[["ts_utc", "cf"]].rename(columns={"cf": "cf_wind"}), on="ts_utc", how="inner")
+        .merge(solar_y[["ts_utc", "cf"]].rename(columns={"cf": "cf_solar"}), on="ts_utc", how="inner")
+        .merge(grid_y[["ts_utc", "cfe"]].rename(columns={"cfe": "grid_cfe"}), on="ts_utc", how="left")
+        .merge(price_y[["ts_utc", "price_eur_per_mwh"]], on="ts_utc", how="left")
+        .sort_values("ts_utc")
+        .reset_index(drop=True)
+    )
+
+    df["demand_mwh"] = pd.to_numeric(df["load_MW"], errors="coerce")
+    df["ci_tco2_per_mwh"], ci_note = convert_ci_to_tco2_per_mwh(df["carbonIntensity"])
+    df["price_eur_per_mwh"] = df["price_eur_per_mwh"].fillna(df["price_eur_per_mwh"].mean())
+
+    df = df.dropna(subset=["demand_mwh", "cf_wind", "cf_solar", "ci_tco2_per_mwh", "price_eur_per_mwh"]).reset_index(drop=True)
+
+    meta = {"ember_datetime_col": dt_col, "ember_price_col": price_col, "ci_note": ci_note}
+    return df, meta
+
+# -----------------------------
 # LP model (Route 1)
 # -----------------------------
 def solve_procurement_lp(df, policy, x_target, allow_battery, params):
@@ -230,7 +222,6 @@ def solve_procurement_lp(df, policy, x_target, allow_battery, params):
     price = df["price_eur_per_mwh"].to_numpy()
     ci = df["ci_tco2_per_mwh"].to_numpy()
 
-    # variables: [W,S,P,E] + imp[T] exp[T] ch[T] dis[T] soc[T]
     idx_W, idx_S, idx_P, idx_E = 0, 1, 2, 3
     base = 4
     idx_imp = base
@@ -242,30 +233,26 @@ def solve_procurement_lp(df, policy, x_target, allow_battery, params):
 
     c = np.zeros(n)
 
-    # annualized capacity costs
     c[idx_W] = annualized_capex_eur(1.0, params["wind_capex_eur_per_kw"], params["fcr"], params["wind_fom_eur_per_kw_yr"])
     c[idx_S] = annualized_capex_eur(1.0, params["solar_capex_eur_per_kw"], params["fcr"], params["solar_fom_eur_per_kw_yr"])
 
     if allow_battery:
-        c[idx_P] = annualized_battery_cost_eur(1.0, 0.0, params)  # €/yr per MW
-        c[idx_E] = annualized_battery_cost_eur(0.0, 1.0, params)  # €/yr per MWh
+        c[idx_P] = annualized_battery_cost_eur(1.0, 0.0, params)
+        c[idx_E] = annualized_battery_cost_eur(0.0, 1.0, params)
     else:
         c[idx_P] = 0.0
         c[idx_E] = 0.0
 
-    # net energy cost
     c[idx_imp:idx_imp+T] = price
     c[idx_exp:idx_exp+T] = -price
 
-    # bounds
     bounds = [(0, None), (0, None)]
     bounds += [(0, None), (0, None)] if allow_battery else [(0, 0), (0, 0)]
     bounds += [(0, None)] * (5*T)
 
-    # Equalities: balance and SOC
-    A_eq = []
-    b_eq = []
+    A_eq, b_eq = [], []
 
+    # balance
     for t in range(T):
         row = np.zeros(n)
         row[idx_W] = cfw[t]
@@ -277,6 +264,7 @@ def solve_procurement_lp(df, policy, x_target, allow_battery, params):
         A_eq.append(row)
         b_eq.append(demand[t])
 
+    # SOC
     eta_ch = params["eta_ch"]
     eta_dis = params["eta_dis"]
     for t in range(T-1):
@@ -298,30 +286,24 @@ def solve_procurement_lp(df, policy, x_target, allow_battery, params):
     A_eq = np.vstack(A_eq)
     b_eq = np.array(b_eq)
 
-    # Inequalities
-    A_ub = []
-    b_ub = []
+    A_ub, b_ub = [], []
 
+    # storage constraints
     for t in range(T):
-        # ch_t <= P
         row = np.zeros(n); row[idx_ch + t] = 1.0; row[idx_P] = -1.0
         A_ub.append(row); b_ub.append(0.0)
-        # dis_t <= P
         row = np.zeros(n); row[idx_dis + t] = 1.0; row[idx_P] = -1.0
         A_ub.append(row); b_ub.append(0.0)
-        # soc_t <= E
         row = np.zeros(n); row[idx_soc + t] = 1.0; row[idx_E] = -1.0
         A_ub.append(row); b_ub.append(0.0)
 
     if policy == "annual":
-        # sum(W*cfw + S*cfs) >= sum(demand)  -> -sum(...) <= -sum(demand)
         row = np.zeros(n)
         row[idx_W] = -cfw.sum()
         row[idx_S] = -cfs.sum()
         A_ub.append(row); b_ub.append(-demand.sum())
 
     elif policy == "hourly":
-        # imp_t <= (1-x)*demand_t
         cap = (1.0 - x_target) * demand
         for t in range(T):
             row = np.zeros(n)
@@ -360,9 +342,6 @@ def solve_procurement_lp(df, policy, x_target, allow_battery, params):
 
     metrics = {
         "W_mw": W, "S_mw": S, "BatP_mw": P, "BatE_mwh": E,
-        "imports_mwh": float(imp.sum()), "exports_mwh": float(exp.sum()),
-        "annualized_capacity_cost_eur": annual_cost,
-        "energy_net_cost_eur": energy_net_cost,
         "total_cost_eur": total_cost,
         "cost_eur_per_mwh": cost_per_mwh,
         "emissions_tco2": emissions,
@@ -387,31 +366,20 @@ def solve_procurement_lp(df, policy, x_target, allow_battery, params):
     return (metrics, ts), None
 
 # -----------------------------
-# Load data (safe)
+# Build dataset (2024 only)
 # -----------------------------
 try:
-    demand, ci, wind, solar, grid, price = load_all()
-    st.write("✅ Data loaded")  # checkpoint 3
+    df, meta = load_and_build_2024()
 except Exception as e:
     st.exception(e)
     st.stop()
 
-years = available_years(demand, ci, wind, solar, grid, price)
-st.write("📆 Available years (intersection):", years)
+st.write("🧾 Ember columns used:", {"Datetime": meta["ember_datetime_col"], "Price": meta["ember_price_col"]})
+st.caption(f"Loaded {len(df)} hourly rows for {YEAR}. CI note: {meta['ci_note']}")
 
-if not years:
-    st.error("No common years across all datasets. (This can happen if only 2024 exists for non-price series.)")
+if len(df) < 24 * 7:
+    st.error("Too few rows after merge/cleaning. Check timestamp alignment across files.")
     st.stop()
-
-st.sidebar.header("Year")
-year = st.sidebar.selectbox("Select year", years, index=len(years)-1)
-
-df, ci_note = build_df_for_year(year, demand, ci, wind, solar, grid, price)
-if df is None or len(df) < 24*7:
-    st.error(f"Year {year} not available or too few rows. Add matching-year datasets for demand/CI/CF/CFE.")
-    st.stop()
-
-st.caption(f"Year={year} | Loaded {len(df)} rows | CI conversion: {ci_note}")
 
 # -----------------------------
 # Sidebar controls
@@ -423,7 +391,7 @@ allow_battery = st.sidebar.checkbox("Include battery", value=True)
 st.sidebar.header("Solver horizon (Cloud-safe)")
 horizon = st.sidebar.selectbox("Optimize over", ["First 7 days", "First 30 days", "4 representative weeks", "Full year (slow)"], index=0)
 df_opt = slice_df(df, horizon)
-st.caption(f"Optimization horizon: {len(df_opt)} hours")
+st.sidebar.caption(f"Optimization hours: {len(df_opt)}")
 
 st.sidebar.header("Tech assumptions (TU-style)")
 TU["fcr"] = st.sidebar.number_input("FCR", value=float(TU["fcr"]), step=0.01)
@@ -433,27 +401,48 @@ TU["bat_power_capex_eur_per_kw"] = st.sidebar.number_input("Battery power CAPEX 
 TU["bat_energy_capex_eur_per_kwh"] = st.sidebar.number_input("Battery energy CAPEX (€/kWh)", value=float(TU["bat_energy_capex_eur_per_kwh"]), step=10.0)
 
 # -----------------------------
-# Tabs (heatmaps don’t require optimization)
+# Tabs
 # -----------------------------
-tab_heat, tab_model = st.tabs(["Heatmaps", "Run model (Annual vs Hourly)"])
+tab_heat, tab_model = st.tabs(["Heatmaps (2024)", "Run model (Annual vs Hourly)"])
 
 with tab_heat:
-    st.subheader("Heatmaps (Spain)")
+    st.subheader("Heatmaps — Spain 2024")
+
     piv_cfe = pivot_day_hour(df["ts_utc"], df["grid_cfe"])
-    st.pyplot(plot_heatmap(piv_cfe, f"Spain — Grid CFE • {year}", "CFE (0–1)", CFE_CMAP, vmin=0, vmax=1, norm=PowerNorm(gamma=1.25)))
+    st.pyplot(plot_heatmap(
+        piv_cfe,
+        "Spain — Grid CFE (2024)",
+        "CFE (0–1)",
+        CFE_CMAP,
+        vmin=0, vmax=1,
+        norm=PowerNorm(gamma=1.25)
+    ))
 
     ci_vals = df["ci_tco2_per_mwh"].to_numpy()
     vmin_ci = float(np.nanpercentile(ci_vals, 5))
     vmax_ci = float(np.nanpercentile(ci_vals, 95))
     piv_ci = pivot_day_hour(df["ts_utc"], df["ci_tco2_per_mwh"])
-    st.pyplot(plot_heatmap(piv_ci, f"Spain — Grid Carbon Intensity • {year}", "tCO₂/MWh", CI_CMAP, vmin=vmin_ci, vmax=vmax_ci, norm=PowerNorm(gamma=1.10)))
+    st.pyplot(plot_heatmap(
+        piv_ci,
+        "Spain — Grid Carbon Intensity (2024)",
+        "tCO₂/MWh",
+        CI_CMAP,
+        vmin=vmin_ci, vmax=vmax_ci,
+        norm=PowerNorm(gamma=1.10)
+    ))
 
     piv_p = pivot_day_hour(df["ts_utc"], df["price_eur_per_mwh"])
-    st.pyplot(plot_heatmap(piv_p, f"Spain — Day-ahead Price • {year}", "€/MWh", PRICE_CMAP, vmin=-200, vmax=200))
+    st.pyplot(plot_heatmap(
+        piv_p,
+        "Spain — Day-ahead Price (2024)",
+        "€/MWh",
+        PRICE_CMAP,
+        vmin=-200, vmax=200
+    ))
 
 with tab_model:
-    st.subheader("Annual vs Hourly (side-by-side)")
-    st.info("Click **Run optimization**. (This avoids Streamlit Cloud crashing on startup.)")
+    st.subheader("Annual vs Hourly — side by side (Spain 2024)")
+    st.info("Click **Run optimization** (avoids startup crashes on Streamlit Cloud).")
 
     run = st.button("▶ Run optimization", type="primary")
 
@@ -502,15 +491,3 @@ with tab_model:
         plt.legend()
         plt.tight_layout()
         st.pyplot(fig)
-
-        st.subheader("Downloads")
-        metrics_df = pd.DataFrame([
-            {"scenario": "annual", "target": 1.0, **mA},
-            {"scenario": "hourly", "target": x_target, **mH},
-        ])
-        st.download_button("Download metrics (CSV)", metrics_df.to_csv(index=False).encode("utf-8"),
-                           "metrics_annual_vs_hourly.csv", "text/csv")
-        st.download_button("Download dispatch (annual) CSV", tsA.to_csv(index=False).encode("utf-8"),
-                           "dispatch_annual.csv", "text/csv")
-        st.download_button("Download dispatch (hourly) CSV", tsH.to_csv(index=False).encode("utf-8"),
-                           "dispatch_hourly.csv", "text/csv")
