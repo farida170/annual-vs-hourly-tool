@@ -2,10 +2,6 @@
 # Spain 2024 — Annual vs Hourly Carbon Accounting (TU-style procurement sizing LP)
 # Tabs: Emissions | Cost | Technology
 # Fixed year: 2024
-# Notes:
-# - No debug prints (files list / ember columns) in UI
-# - Matplotlib norm + vmin/vmax conflict fixed
-# - SciPy imported only when user clicks run
 
 from pathlib import Path
 
@@ -16,14 +12,12 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, PowerNorm
 
 st.set_page_config(page_title="Annual vs Hourly — Spain (2024)", layout="wide")
-
 YEAR = 2024
 
 # -----------------------------
-# Paths
+# Data paths (repo-relative)
 # -----------------------------
 DATA_DIR = Path(__file__).parent / "data"
-
 REQUIRED = [
     "ES_demand_2024.csv",
     "ES_carbon_intensity_hourly_2024.csv",
@@ -53,11 +47,10 @@ FILES = {
 
 # -----------------------------
 # TU-style assumptions (editable)
-# -----------------------------
-# These are "annuitized cost" parameters used in the LP objective.
 # Annualized cost = CAPEX * FCR + fixed O&M
+# -----------------------------
 TU = {
-    "fcr": 0.07,  # fixed charge rate (annuity factor)
+    "fcr": 0.07,
     "wind_capex_eur_per_kw": 1200,
     "wind_fom_eur_per_kw_yr": 35,
     "solar_capex_eur_per_kw": 600,
@@ -70,12 +63,8 @@ TU = {
 }
 
 # -----------------------------
-# TU-style "portfolios / palettes" (simple + thesis-ready)
+# TU-style palettes (3)
 # -----------------------------
-# Palette 1: Wind + Solar only
-# Palette 2: Wind + Solar + Batteries
-# Palette 3: Wind + Solar + Batteries + (optional) clean firming proxy (not solved yet)
-# For now palette 3 behaves like 2, but we show it in UI and reserve it for later upgrades.
 PALETTES = {
     "Palette 1 — Wind + Solar": {"wind": True, "solar": True, "battery": False, "firm_clean_proxy": False},
     "Palette 2 — Wind + Solar + Battery": {"wind": True, "solar": True, "battery": True, "firm_clean_proxy": False},
@@ -98,11 +87,13 @@ CI_CMAP = LinearSegmentedColormap.from_list(
 )
 PRICE_CMAP = plt.get_cmap("RdYlGn_r")
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
 def parse_ts_utc(series):
     return pd.to_datetime(series, errors="coerce", utc=True)
+
 
 def convert_ci_to_tco2_per_mwh(ci_series):
     x = pd.to_numeric(ci_series, errors="coerce")
@@ -112,9 +103,11 @@ def convert_ci_to_tco2_per_mwh(ci_series):
         return x * 0.001, "gCO2/kWh → tCO2/MWh (×0.001)"
     return x, "tCO2/MWh (assumed)"
 
+
 def annualized_capex_eur(cap_mw, capex_eur_per_kw, fcr, fom_eur_per_kw_yr):
     cap_kw = cap_mw * 1000.0
     return cap_kw * (capex_eur_per_kw * fcr + fom_eur_per_kw_yr)
+
 
 def annualized_battery_cost_eur(p_mw, e_mwh, params):
     p_kw = p_mw * 1000.0
@@ -122,13 +115,15 @@ def annualized_battery_cost_eur(p_mw, e_mwh, params):
     capex = p_kw * params["bat_power_capex_eur_per_kw"] + e_kwh * params["bat_energy_capex_eur_per_kwh"]
     return capex * params["fcr"] + p_kw * params["bat_fom_eur_per_kw_yr"]
 
+
 def pivot_day_hour(ts_utc, values):
     tmp = pd.DataFrame({"ts": ts_utc, "v": values}).dropna()
     tmp["date"] = tmp["ts"].dt.date
     tmp["hour"] = tmp["ts"].dt.hour
     return tmp.pivot_table(index="date", columns="hour", values="v", aggfunc="mean").reindex(columns=list(range(24)))
 
-# FIXED: do not pass vmin/vmax when norm is provided
+
+# IMPORTANT: If norm is provided, DO NOT pass vmin/vmax to imshow
 def plot_heatmap(pivot, title, cbar_label, cmap, vmin=None, vmax=None, norm=None):
     fig = plt.figure(figsize=(10, 4.6))
     data = pivot.to_numpy()
@@ -146,6 +141,7 @@ def plot_heatmap(pivot, title, cbar_label, cmap, vmin=None, vmax=None, norm=None
     plt.tight_layout()
     return fig
 
+
 def detect_ember_columns(price_df: pd.DataFrame):
     dt_col = next((c for c in price_df.columns if "datetime" in c.lower() and "utc" in c.lower()), None)
     if dt_col is None:
@@ -157,12 +153,13 @@ def detect_ember_columns(price_df: pd.DataFrame):
 
     return dt_col, price_col
 
+
 def slice_df(df, mode):
     df = df.sort_values("ts_utc").reset_index(drop=True)
     if mode == "First 7 days":
-        return df.iloc[:24*7].copy()
+        return df.iloc[:24 * 7].copy()
     if mode == "First 30 days":
-        return df.iloc[:24*30].copy()
+        return df.iloc[:24 * 30].copy()
     if mode == "4 representative weeks":
         year = int(df["ts_utc"].dt.year.iloc[0])
         chunks = []
@@ -172,8 +169,9 @@ def slice_df(df, mode):
             chunk = df[(df["ts_utc"] >= start) & (df["ts_utc"] < end)]
             if len(chunk) > 0:
                 chunks.append(chunk)
-        return pd.concat(chunks).reset_index(drop=True) if chunks else df.iloc[:24*14].copy()
-    return df  # Full year
+        return pd.concat(chunks).reset_index(drop=True) if chunks else df.iloc[:24 * 14].copy()
+    return df  # full year
+
 
 # -----------------------------
 # Load + build 2024 dataset
@@ -224,16 +222,18 @@ def load_and_build_2024():
     df["ci_tco2_per_mwh"], ci_note = convert_ci_to_tco2_per_mwh(df["carbonIntensity"])
     df["price_eur_per_mwh"] = df["price_eur_per_mwh"].fillna(df["price_eur_per_mwh"].mean())
 
-    df = df.dropna(subset=["demand_mwh", "cf_wind", "cf_solar", "ci_tco2_per_mwh", "price_eur_per_mwh"]).reset_index(drop=True)
-
+    df = df.dropna(subset=["demand_mwh", "cf_wind", "cf_solar", "ci_tco2_per_mwh", "price_eur_per_mwh"]).reset_index(
+        drop=True
+    )
     meta = {"ci_note": ci_note}
     return df, meta
+
 
 # -----------------------------
 # LP model (Route 1)
 # -----------------------------
 def solve_procurement_lp(df, policy, x_target, palette, params):
-    from scipy.optimize import linprog
+    from scipy.optimize import linprog  # import only when solving
 
     tech = PALETTES[palette]
     allow_wind = tech["wind"]
@@ -251,15 +251,19 @@ def solve_procurement_lp(df, policy, x_target, palette, params):
     base = 4
     idx_imp = base
     idx_exp = base + T
-    idx_ch  = base + 2*T
-    idx_dis = base + 3*T
-    idx_soc = base + 4*T
-    n = base + 5*T
+    idx_ch = base + 2 * T
+    idx_dis = base + 3 * T
+    idx_soc = base + 4 * T
+    n = base + 5 * T
 
     c = np.zeros(n)
 
-    c[idx_W] = annualized_capex_eur(1.0, params["wind_capex_eur_per_kw"], params["fcr"], params["wind_fom_eur_per_kw_yr"])
-    c[idx_S] = annualized_capex_eur(1.0, params["solar_capex_eur_per_kw"], params["fcr"], params["solar_fom_eur_per_kw_yr"])
+    c[idx_W] = annualized_capex_eur(
+        1.0, params["wind_capex_eur_per_kw"], params["fcr"], params["wind_fom_eur_per_kw_yr"]
+    )
+    c[idx_S] = annualized_capex_eur(
+        1.0, params["solar_capex_eur_per_kw"], params["fcr"], params["solar_fom_eur_per_kw_yr"]
+    )
 
     if allow_battery:
         c[idx_P] = annualized_battery_cost_eur(1.0, 0.0, params)
@@ -268,52 +272,49 @@ def solve_procurement_lp(df, policy, x_target, palette, params):
         c[idx_P] = 0.0
         c[idx_E] = 0.0
 
-    c[idx_imp:idx_imp+T] = price
-    c[idx_exp:idx_exp+T] = -price
+    c[idx_imp : idx_imp + T] = price
+    c[idx_exp : idx_exp + T] = -price
 
     # bounds
     bounds = []
-    # W, S
     bounds.append((0, None) if allow_wind else (0, 0))
     bounds.append((0, None) if allow_solar else (0, 0))
-    # Battery P, E
     if allow_battery:
         bounds += [(0, None), (0, None)]
     else:
         bounds += [(0, 0), (0, 0)]
-    # time vars
-    bounds += [(0, None)] * (5*T)
+    bounds += [(0, None)] * (5 * T)
 
     A_eq, b_eq = [], []
 
-    # power balance: W*cfw + S*cfs + dis + imp - ch - exp = demand
+    # balance
     for t in range(T):
         row = np.zeros(n)
         row[idx_W] = cfw[t]
         row[idx_S] = cfs[t]
         row[idx_dis + t] = 1.0
         row[idx_imp + t] = 1.0
-        row[idx_ch + t]  = -1.0
+        row[idx_ch + t] = -1.0
         row[idx_exp + t] = -1.0
         A_eq.append(row)
         b_eq.append(demand[t])
 
-    # SOC dynamics
+    # SOC
     eta_ch = params["eta_ch"]
     eta_dis = params["eta_dis"]
-    for t in range(T-1):
+    for t in range(T - 1):
         row = np.zeros(n)
-        row[idx_soc + (t+1)] = 1.0
+        row[idx_soc + (t + 1)] = 1.0
         row[idx_soc + t] = -1.0
         row[idx_ch + t] = -eta_ch
-        row[idx_dis + t] = 1.0/eta_dis
+        row[idx_dis + t] = 1.0 / eta_dis
         A_eq.append(row)
         b_eq.append(0.0)
 
     # cyclic SOC
     row = np.zeros(n)
     row[idx_soc + 0] = 1.0
-    row[idx_soc + (T-1)] = -1.0
+    row[idx_soc + (T - 1)] = -1.0
     A_eq.append(row)
     b_eq.append(0.0)
 
@@ -324,28 +325,38 @@ def solve_procurement_lp(df, policy, x_target, palette, params):
 
     # storage constraints
     for t in range(T):
-        row = np.zeros(n); row[idx_ch + t] = 1.0; row[idx_P] = -1.0
-        A_ub.append(row); b_ub.append(0.0)
-        row = np.zeros(n); row[idx_dis + t] = 1.0; row[idx_P] = -1.0
-        A_ub.append(row); b_ub.append(0.0)
-        row = np.zeros(n); row[idx_soc + t] = 1.0; row[idx_E] = -1.0
-        A_ub.append(row); b_ub.append(0.0)
+        row = np.zeros(n)
+        row[idx_ch + t] = 1.0
+        row[idx_P] = -1.0
+        A_ub.append(row)
+        b_ub.append(0.0)
 
-    # policy constraints
+        row = np.zeros(n)
+        row[idx_dis + t] = 1.0
+        row[idx_P] = -1.0
+        A_ub.append(row)
+        b_ub.append(0.0)
+
+        row = np.zeros(n)
+        row[idx_soc + t] = 1.0
+        row[idx_E] = -1.0
+        A_ub.append(row)
+        b_ub.append(0.0)
+
     if policy == "annual":
-        # annual RE generation >= annual demand
         row = np.zeros(n)
         row[idx_W] = -cfw.sum()
         row[idx_S] = -cfs.sum()
-        A_ub.append(row); b_ub.append(-demand.sum())
+        A_ub.append(row)
+        b_ub.append(-demand.sum())
 
     elif policy == "hourly":
-        # limit imports each hour to (1-x)*demand (i.e., clean share >= x)
         cap = (1.0 - x_target) * demand
         for t in range(T):
             row = np.zeros(n)
             row[idx_imp + t] = 1.0
-            A_ub.append(row); b_ub.append(float(cap[t]))
+            A_ub.append(row)
+            b_ub.append(float(cap[t]))
 
     A_ub = np.vstack(A_ub)
     b_ub = np.array(b_ub)
@@ -356,20 +367,20 @@ def solve_procurement_lp(df, policy, x_target, palette, params):
 
     x = res.x
     W, S, P, E = x[idx_W], x[idx_S], x[idx_P], x[idx_E]
-    imp = x[idx_imp:idx_imp+T]
-    exp = x[idx_exp:idx_exp+T]
-    ch  = x[idx_ch:idx_ch+T]
-    dis = x[idx_dis:idx_dis+T]
-    soc = x[idx_soc:idx_soc+T]
+    imp = x[idx_imp : idx_imp + T]
+    exp = x[idx_exp : idx_exp + T]
+    ch = x[idx_ch : idx_ch + T]
+    dis = x[idx_dis : idx_dis + T]
+    soc = x[idx_soc : idx_soc + T]
 
     emissions = float(np.sum(imp * ci))
     total_demand = float(demand.sum())
     emis_rate = emissions / total_demand if total_demand > 0 else np.nan
 
     annual_cost = (
-        annualized_capex_eur(W, params["wind_capex_eur_per_kw"], params["fcr"], params["wind_fom_eur_per_kw_yr"]) +
-        annualized_capex_eur(S, params["solar_capex_eur_per_kw"], params["fcr"], params["solar_fom_eur_per_kw_yr"]) +
-        (annualized_battery_cost_eur(P, E, params) if allow_battery else 0.0)
+        annualized_capex_eur(W, params["wind_capex_eur_per_kw"], params["fcr"], params["wind_fom_eur_per_kw_yr"])
+        + annualized_capex_eur(S, params["solar_capex_eur_per_kw"], params["fcr"], params["solar_fom_eur_per_kw_yr"])
+        + (annualized_battery_cost_eur(P, E, params) if allow_battery else 0.0)
     )
     energy_net_cost = float(np.sum(price * imp) - np.sum(price * exp))
     total_cost = annual_cost + energy_net_cost
@@ -378,7 +389,10 @@ def solve_procurement_lp(df, policy, x_target, palette, params):
     achieved_clean_share = 1.0 - np.mean(np.divide(imp, demand, out=np.zeros_like(imp), where=demand > 0))
 
     metrics = {
-        "W_mw": W, "S_mw": S, "BatP_mw": P, "BatE_mwh": E,
+        "W_mw": W,
+        "S_mw": S,
+        "BatP_mw": P,
+        "BatE_mwh": E,
         "total_cost_eur": total_cost,
         "cost_eur_per_mwh": cost_per_mwh,
         "emissions_tco2": emissions,
@@ -388,54 +402,44 @@ def solve_procurement_lp(df, policy, x_target, palette, params):
         "annualized_tech_cost_eur": annual_cost,
     }
 
-    ts = pd.DataFrame({
-        "ts_utc": df["ts_utc"],
-        "demand_mwh": demand,
-        "import_mwh": imp,
-        "export_mwh": exp,
-        "ch_mwh": ch,
-        "dis_mwh": dis,
-        "soc_mwh": soc,
-        "ci_tco2_per_mwh": ci,
-        "grid_cfe": df["grid_cfe"].to_numpy(),
-        "price_eur_per_mwh": price,
-    })
+    ts = pd.DataFrame(
+        {
+            "ts_utc": df["ts_utc"],
+            "demand_mwh": demand,
+            "import_mwh": imp,
+            "export_mwh": exp,
+            "ch_mwh": ch,
+            "dis_mwh": dis,
+            "soc_mwh": soc,
+            "ci_tco2_per_mwh": ci,
+            "grid_cfe": df["grid_cfe"].to_numpy(),
+            "price_eur_per_mwh": price,
+        }
+    )
     ts["hourly_clean_share"] = 1.0 - np.divide(ts["import_mwh"], ts["demand_mwh"], out=np.zeros(T), where=ts["demand_mwh"] > 0)
     ts["hourly_emissions_tco2"] = ts["import_mwh"] * ts["ci_tco2_per_mwh"]
-
+    ts["hourly_market_cost_eur"] = ts["import_mwh"] * ts["price_eur_per_mwh"]
     return (metrics, ts), None
 
+
 # -----------------------------
-# Load data
+# App UI
 # -----------------------------
 st.title("Annual vs Hourly Carbon Accounting — Spain (2024)")
-st.caption("TU-style procurement sizing LP + visual diagnostics. (Fixed year: 2024)")
+st.caption("Diagnostics + TU-style procurement sizing LP. (Fixed year: 2024)")
 
-try:
-    df, meta = load_and_build_2024()
-except Exception as e:
-    st.exception(e)
-    st.stop()
+df, meta = load_and_build_2024()
 
-if len(df) < 24 * 7:
-    st.error("Too few rows after merge/cleaning. Check timestamp alignment across files.")
-    st.stop()
-
-# -----------------------------
-# Sidebar (global controls)
-# -----------------------------
-st.sidebar.header("Scenario controls")
-
-policy_view = st.sidebar.radio("Comparison", ["Annual vs Hourly"], index=0)
+# Sidebar
+st.sidebar.header("Scenario")
 x_target = st.sidebar.slider("Hourly target (x)", 0.80, 1.00, 0.90, 0.01)
-
 palette = st.sidebar.selectbox("Technology palette (TU-style)", list(PALETTES.keys()), index=1)
 
-st.sidebar.header("Solver horizon (Cloud-safe)")
+st.sidebar.header("Solve horizon (Cloud-safe)")
 horizon = st.sidebar.selectbox(
     "Optimize over",
     ["First 7 days", "First 30 days", "4 representative weeks", "Full year (slow)"],
-    index=0
+    index=0,
 )
 df_opt = slice_df(df, horizon)
 st.sidebar.caption(f"Optimization hours: {len(df_opt)}")
@@ -447,54 +451,58 @@ with st.sidebar.expander("Tech assumptions (TU-style)"):
     TU["bat_power_capex_eur_per_kw"] = st.number_input("Battery power CAPEX (€/kW)", value=float(TU["bat_power_capex_eur_per_kw"]), step=25.0)
     TU["bat_energy_capex_eur_per_kwh"] = st.number_input("Battery energy CAPEX (€/kWh)", value=float(TU["bat_energy_capex_eur_per_kwh"]), step=10.0)
 
-# -----------------------------
-# Tabs: Emissions | Cost | Technology
-# -----------------------------
+st.sidebar.divider()
+run = st.sidebar.button("▶ Run optimization", type="primary")
+
+solA = solH = None
+errA = errH = None
+if run:
+    with st.spinner("Solving Annual and Hourly LPs…"):
+        solA, errA = solve_procurement_lp(df_opt, "annual", 1.0, palette, TU)
+        solH, errH = solve_procurement_lp(df_opt, "hourly", x_target, palette, TU)
+
+    if errA:
+        st.error(errA)
+    if errH:
+        st.error(errH)
+
 tab_emis, tab_cost, tab_tech = st.tabs(["Emissions", "Cost", "Technology"])
 
-# -----------------------------
 # Emissions tab
-# -----------------------------
 with tab_emis:
-    st.subheader("Emissions diagnostics (Spain 2024)")
+    st.subheader("Emissions")
 
     c1, c2 = st.columns(2)
     with c1:
         piv_cfe = pivot_day_hour(df["ts_utc"], df["grid_cfe"])
-        st.pyplot(plot_heatmap(
-            piv_cfe,
-            "Grid carbon-free share (CFE) — Spain 2024",
-            "CFE (0–1)",
-            CFE_CMAP,
-            norm=PowerNorm(gamma=1.25, vmin=0, vmax=1)
-        ))
+        st.pyplot(
+            plot_heatmap(
+                piv_cfe,
+                "Grid carbon-free share (CFE) — Spain 2024",
+                "CFE (0–1)",
+                CFE_CMAP,
+                norm=PowerNorm(gamma=1.25, vmin=0, vmax=1),
+            )
+        )
     with c2:
         ci_vals = df["ci_tco2_per_mwh"].to_numpy()
         vmin_ci = float(np.nanpercentile(ci_vals, 5))
         vmax_ci = float(np.nanpercentile(ci_vals, 95))
         piv_ci = pivot_day_hour(df["ts_utc"], df["ci_tco2_per_mwh"])
-        st.pyplot(plot_heatmap(
-            piv_ci,
-            "Grid carbon intensity — Spain 2024",
-            "tCO₂/MWh",
-            CI_CMAP,
-            norm=PowerNorm(gamma=1.10, vmin=vmin_ci, vmax=vmax_ci)
-        ))
+        st.pyplot(
+            plot_heatmap(
+                piv_ci,
+                "Grid carbon intensity — Spain 2024",
+                "tCO₂/MWh",
+                CI_CMAP,
+                norm=PowerNorm(gamma=1.10, vmin=vmin_ci, vmax=vmax_ci),
+            )
+        )
 
-    st.markdown("### Annual vs Hourly emissions (model-based)")
-    st.caption("Click run to compute annual vs hourly procurement outcomes and resulting consumption emissions from grid imports.")
+    st.markdown("### Annual vs Hourly (model outputs)")
+    st.caption("Run the solver from the sidebar to populate the comparisons below.")
 
-    run = st.button("▶ Run optimization (Emissions)", type="primary", key="run_emis")
-    if run:
-        with st.spinner("Solving LPs…"):
-            solA, errA = solve_procurement_lp(df_opt, "annual", 1.0, palette, TU)
-            solH, errH = solve_procurement_lp(df_opt, "hourly", x_target, palette, TU)
-
-        if errA:
-            st.error(errA); st.stop()
-        if errH:
-            st.error(errH); st.stop()
-
+    if solA and solH and not (errA or errH):
         mA, tsA = solA
         mH, tsH = solH
 
@@ -510,10 +518,129 @@ with tab_emis:
             st.metric("Emissions rate (tCO₂/MWh)", f"{mH['emissions_rate_tco2_per_mwh']:.3f}")
             st.metric("Achieved clean share", f"{mH['achieved_clean_share']*100:.1f}%")
 
-        st.markdown("**Hourly clean share distribution (Annual vs Hourly):**")
+        st.markdown("**Hourly clean share distribution:**")
         fig = plt.figure(figsize=(10, 3.5))
         plt.hist(tsA["hourly_clean_share"].clip(0, 1), bins=40, alpha=0.6, label="Annual")
         plt.hist(tsH["hourly_clean_share"].clip(0, 1), bins=40, alpha=0.6, label="Hourly")
         plt.xlabel("Hourly clean share (1 − imports/demand)")
-        plt理解
-::contentReference[oaicite:0]{index=0}
+        plt.ylabel("Hours")
+        plt.legend()
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("Click **Run optimization** in the sidebar to see annual vs hourly emissions results.")
+
+# Cost tab
+with tab_cost:
+    st.subheader("Cost")
+
+    piv_p = pivot_day_hour(df["ts_utc"], df["price_eur_per_mwh"])
+    st.pyplot(
+        plot_heatmap(
+            piv_p,
+            "Day-ahead price — Spain 2024",
+            "€/MWh",
+            PRICE_CMAP,
+            vmin=-200,
+            vmax=200,
+            norm=None,
+        )
+    )
+
+    st.markdown("### Annual vs Hourly (model outputs)")
+    st.caption("Costs = annualized tech costs + net market import cost (imports − exports).")
+
+    if solA and solH and not (errA or errH):
+        mA, tsA = solA
+        mH, tsH = solH
+
+        colA, colH = st.columns(2, gap="large")
+        with colA:
+            st.markdown("#### Annual matching")
+            st.metric("Total cost (€/MWh)", f"{mA['cost_eur_per_mwh']:.2f}")
+            st.metric("Annualized tech cost (M€)", f"{mA['annualized_tech_cost_eur']/1e6:.2f}")
+            st.metric("Net market energy cost (M€)", f"{mA['energy_net_cost_eur']/1e6:.2f}")
+        with colH:
+            st.markdown(f"#### Hourly matching (target {int(x_target*100)}%)")
+            st.metric("Total cost (€/MWh)", f"{mH['cost_eur_per_mwh']:.2f}")
+            st.metric("Annualized tech cost (M€)", f"{mH['annualized_tech_cost_eur']/1e6:.2f}")
+            st.metric("Net market energy cost (M€)", f"{mH['energy_net_cost_eur']/1e6:.2f}")
+
+        st.markdown("**Hourly market cost distribution (imports × price):**")
+        fig = plt.figure(figsize=(10, 3.5))
+        plt.hist(tsA["hourly_market_cost_eur"], bins=50, alpha=0.6, label="Annual")
+        plt.hist(tsH["hourly_market_cost_eur"], bins=50, alpha=0.6, label="Hourly")
+        plt.xlabel("Hourly market cost (€)")
+        plt.ylabel("Hours")
+        plt.legend()
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("Click **Run optimization** in the sidebar to see annual vs hourly cost results.")
+
+# Technology tab
+with tab_tech:
+    st.subheader("Technology")
+
+    st.markdown("### Technology palette (TU-style)")
+    st.write(f"Selected: **{palette}**")
+    tech = PALETTES[palette]
+    st.write(
+        {
+            "Wind allowed": tech["wind"],
+            "Solar allowed": tech["solar"],
+            "Battery allowed": tech["battery"],
+            "Firm clean proxy": tech["firm_clean_proxy"],
+        }
+    )
+
+    st.markdown("### Annual vs Hourly capacity outcomes")
+    st.caption("Procured capacities that minimize cost under each accounting rule.")
+
+    if solA and solH and not (errA or errH):
+        mA, _ = solA
+        mH, _ = solH
+
+        cap = pd.DataFrame(
+            {
+                "Technology": ["Wind (MW)", "Solar (MW)", "Battery Power (MW)", "Battery Energy (MWh)"],
+                "Annual": [mA["W_mw"], mA["S_mw"], mA["BatP_mw"], mA["BatE_mwh"]],
+                "Hourly": [mH["W_mw"], mH["S_mw"], mH["BatP_mw"], mH["BatE_mwh"]],
+            }
+        )
+        st.dataframe(cap, use_container_width=True)
+
+        fig = plt.figure(figsize=(9, 3.8))
+        x = np.arange(len(cap["Technology"]))
+        w = 0.38
+        plt.bar(x - w / 2, cap["Annual"], width=w, label="Annual")
+        plt.bar(x + w / 2, cap["Hourly"], width=w, label="Hourly")
+        plt.xticks(x, cap["Technology"])
+        plt.ylabel("Capacity")
+        plt.title("Procured capacities — Annual vs Hourly")
+        plt.legend()
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("Click **Run optimization** in the sidebar to compute technology sizing under annual vs hourly accounting.")
+
+# Explanation block
+st.divider()
+with st.expander("What do these Tech assumptions (TU-style) represent?"):
+    st.markdown(
+        """
+**These parameters convert technology build-out into an annual cost term in the optimization objective.**
+
+- **FCR (Fixed Charge Rate)**: converts upfront CAPEX into an equivalent annual payment (financing + lifetime).
+  - Annualized CAPEX ≈ **CAPEX × FCR**
+- **Wind / Solar CAPEX (€/kW)**: upfront investment per kW installed.
+- **Battery power CAPEX (€/kW)**: inverter / power component (MW limit).
+- **Battery energy CAPEX (€/kWh)**: cell / energy component (MWh duration).
+
+The model minimizes:
+
+**Total Cost = Annualized Tech Cost + Market Cost of Imports − Market Value of Exports**
+
+…and compares how *annual* vs *hourly* accounting changes the optimal portfolio and the resulting emissions/cost trade-offs.
+"""
+    )
